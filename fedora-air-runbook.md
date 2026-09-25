@@ -77,13 +77,23 @@ reports taken from this machine.
 
 ---
 
-## 3. Wifi — Broadcom BCM4360
+## 3. Wifi — Broadcom BCM4360 (`14e4:43a0`)
 
-### What's installed
+The card needs Broadcom's proprietary `wl` driver: unmaintained, hostile to suspend, incapable of
+WPA3, and it weakens the kernel's Spectre mitigations. Everything in this section exists to work
+around one of those four facts. **Do this first on a fresh install** — the camera build and
+everything else wants a network.
 
-RPMFusion `akmod-wl` + `broadcom-wl` + `kmod-wl`. The package ships
-`/usr/lib/modprobe.d/broadcom-wl-blacklist.conf`, which blacklists `b43`, `bcma`, `brcmsmac`
-etc. so they don't fight `wl` for the card. Don't remove that.
+What a finished installation looks like:
+
+| Piece | What |
+|---|---|
+| RPMFusion free + nonfree | the repos `wl` comes from |
+| `akmod-wl` + `broadcom-wl` | driver source and the blacklist for the in-tree drivers |
+| `kmod-wl-<kernel>` | the built module, from akmods |
+| `/lib/modules/<kernel>/extra/wl/wl.ko.xz` | where it lands |
+| `wlp3s0` | the interface |
+| three local workarounds | sleep hook, profile watcher, PMF default — see below |
 
 ### Why three extra workarounds exist
 
@@ -101,6 +111,92 @@ The `wl` driver is unmaintained and has three defects that matter here:
    and follows it with `WARNING: Unpatched return thunk in use. This should not happen!`
    — the module isn't built with return thunks, which weakens Spectre/retbleed mitigations
    system-wide.
+
+### Prerequisites
+
+```sh
+lspci -nn | grep 14e4:43a0        # confirm the card
+sudo dnf install -y gcc kernel-devel     # akmods needs these to build the module
+```
+
+You need a temporary network to install from: USB tethering from a phone, a USB ethernet adapter,
+or a USB wifi adapter. There is no way to install the driver over the wifi it provides.
+
+### Install
+
+**1. Enable RPMFusion** (free and nonfree — `wl` is in nonfree, which depends on free):
+
+```sh
+sudo dnf install -y \
+  https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm \
+  https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm
+```
+
+**2. Install the driver.** `akmod-wl` builds the module locally against the running kernel;
+`broadcom-wl` is the common package that ships
+`/usr/lib/modprobe.d/broadcom-wl-blacklist.conf`, which blacklists `ssb`, `bcma`, `b43`,
+`brcmsmac` and `brcmfmac` so they cannot claim the card first. **Don't remove that file.**
+
+```sh
+sudo dnf install -y akmod-wl broadcom-wl
+sudo akmods --force            # build now rather than waiting for the next boot
+sudo modprobe wl
+```
+
+The build produces `kmod-wl-<kernel-version>`, which is what actually provides `wl.ko`. On this
+machine that package was force-installed by hand early on
+(`dnf install --nogpgcheck --disablerepo=...`) before `akmods` had run; that is a workaround for
+an impatient install, not a requirement — `akmods --force` is the normal path.
+
+**3. Install the three local workarounds** — the sleep hook, the profile watcher and the PMF
+default, all described below. From the repo: `sudo ./install.sh`.
+
+### Verify
+
+```sh
+modinfo wl | grep -E 'filename|license'   # extra/wl/wl.ko.xz, MIXED/Proprietary
+lsmod | grep '^wl'
+nmcli device                              # expect wlp3s0, wifi, disconnected or connected
+rfkill list wifi                          # must not be blocked
+nmcli device wifi list | head             # scanning works
+```
+
+Expect these in the journal, on every boot, all of them normal for this driver:
+
+```
+wl: module license 'MIXED/Proprietary' taints kernel.
+Disabling lock debugging due to kernel taint
+You are using the Broadcom STA wireless driver, which is not maintained and is
+  incompatible with Linux kernel security mitigations. ...
+Unpatched return thunk in use. This should not happen!
+```
+
+If `nmcli device` shows no wifi device, the usual cause is that an in-tree driver won the race:
+check `lsmod | grep -E 'b43|bcma|ssb|brcm'` and confirm the blacklist file is present.
+
+### Connecting
+
+The home network is a WPA2/WPA3 *transition* SSID on 5 GHz, with a separate 2.4 GHz SSID.
+Because plasma-nm would have saved it as SAE, the profile was created by hand:
+
+```sh
+nmcli connection add type wifi con-name <ssid> ssid <ssid> \
+    wifi-sec.key-mgmt wpa-psk wifi-sec.pmf disable wifi-sec.psk '<passphrase>'
+```
+
+(`nmcli -f NAME,TYPE connection show` lists what exists now.)
+
+### On kernel upgrades
+
+`akmod-wl` rebuilds `wl` when a new kernel is installed, through `akmods.service`, provided
+`gcc` and a matching `kernel-devel` are present. **A kernel that boots fine can have no wifi**, so
+verify rather than assume:
+
+```sh
+modinfo wl | grep filename       # must name the running kernel's directory
+sudo akmods --force              # if it doesn't; then reboot or modprobe wl
+journalctl -u akmods -b          # build log when that fails
+```
 
 ### `/usr/lib/systemd/system-sleep/wl-reload`
 
@@ -135,16 +231,6 @@ created with PMF on in the first place.
 
 A **WPA3-only** network still cannot work on this card. No workaround exists.
 
-The home network is a WPA2/WPA3 *transition* SSID on 5 GHz, with a separate 2.4 GHz SSID.
-Because plasma-nm would have saved it as SAE, the profile was created by hand:
-
-```sh
-nmcli connection add type wifi con-name <ssid> ssid <ssid> \
-    wifi-sec.key-mgmt wpa-psk wifi-sec.pmf disable wifi-sec.psk '<passphrase>'
-```
-
-(`nmcli -f NAME,TYPE connection show` lists what exists now.)
-
 ### The exit plan
 
 Buy a USB adapter with a **MediaTek MT7921AU** chipset. Its `mt7921u` driver has been
@@ -170,6 +256,11 @@ ls /sys/class/net/*/device/driver      # want mt7921u
 If it needs a driver disc or a GitHub repo, send it back.
 
 Replacing the internal card is not an option — it's an Apple-proprietary module, not M.2.
+
+
+### Removal
+
+Only after a replacement adapter works — you will otherwise have no network. See §10.
 
 ---
 
