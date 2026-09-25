@@ -1,0 +1,32 @@
+#!/bin/sh
+# The out-of-tree facetimehd driver redoes a full hardware bring-up on every
+# resume -- PCIe link init, PLL lock, DDR40 PHY calibration, 1.4MB firmware
+# reload -- and is the prime suspect for the 2026-09-17 hang where the kernel
+# never finished resuming. Upstream ships this same unload/reload workaround in
+# its own installation docs.
+#
+# The reload is deliberately detached via systemd-run: there are reports of
+# "modprobe facetimehd" itself wedging machines, and every post hook runs while
+# user.slice is still frozen, so a blocking reload would take the desktop down
+# with it. Detached, a slow or stuck reload costs you the webcam, not the session.
+#
+# Local, not packaged -- delete this file to undo.
+MARKER=/run/facetimehd-unloaded
+
+case "$1" in
+    pre)
+        # Fails harmlessly if something holds /dev/video0; then we simply leave
+        # the module loaded and behave as before. Only reload what we unloaded.
+        if /usr/sbin/modprobe -r facetimehd 2>/dev/null; then
+            : > "$MARKER"
+        fi
+        ;;
+    post)
+        if [ -e "$MARKER" ]; then
+            rm -f "$MARKER"
+            /usr/bin/systemd-run --no-block --unit=facetimehd-reload \
+                /usr/sbin/modprobe facetimehd >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+exit 0

@@ -1,0 +1,158 @@
+#!/usr/bin/python3
+"""Log real S3 suspend drain to /var/log/suspend-drain.log.
+
+Why this exists: upower's own history cannot measure suspend drain on this
+machine. Its first post-resume sample lands 16-45s after wake, by which point
+the machine has burned more charge awake than the whole suspend cost, so the
+measured delta is a fixed ~0.17pp offset no matter how long the suspend was.
+See the runbook, "S3 suspend drain".
+
+Two things are needed to get this right:
+
+1. Read the raw charge counter at the *instants* around the suspend, not on a
+   polling timer -- so `post` runs before any meaningful awake drain accrues.
+
+2. Recover the suspend duration, which is genuinely hard here: pm_trace
+   clobbers the RTC, so the kernel cannot work out how long it slept and
+   neither the system clock nor CLOCK_BOOTTIME advance across the suspend.
+   The trick is CLOCK_MONOTONIC, which by definition excludes suspend time:
+
+       suspended = (wall_now - wall_at_suspend) - (mono_now - mono_at_suspend)
+
+   Total elapsed minus awake elapsed. That needs a *correct* wall clock, which
+   only exists once chrony has stepped it, so the arithmetic is deferred to the
+   `finish` phase run detached ~90s after resume. It works whether or not
+   pm_trace is armed.
+
+State files are per-cycle and their path is handed to `finish` explicitly.
+Suspends can land closer together than the 90s deferral -- this machine has
+done two 79s apart -- and a single shared state file plus a fixed transient
+unit name would collide and log one garbage row per overlap.
+
+Local, not packaged -- delete this file and /var/log/suspend-drain.log to undo.
+"""
+import glob
+import os
+import sys
+import time
+
+STATE_GLOB = "/run/battery-drain.*.state"
+LOG = "/var/log/suspend-drain.log"
+BAT = "/sys/class/power_supply/BAT0"
+
+
+def sample():
+    def rd(name):
+        with open(os.path.join(BAT, name)) as f:
+            return int(f.read().strip())
+    return {
+        "wall": time.time(),
+        "mono": time.clock_gettime(time.CLOCK_MONOTONIC),
+        "charge_uah": rd("charge_now"),
+        "voltage_uv": rd("voltage_now"),
+    }
+
+
+def write_state(path, d):
+    tmp = path + ".new"
+    with open(tmp, "w") as f:
+        for k, v in d.items():
+            f.write(f"{k}={v}\n")
+    os.replace(tmp, path)
+
+
+def read_state(path):
+    d = {}
+    with open(path) as f:
+        for line in f:
+            k, _, v = line.strip().partition("=")
+            d[k] = float(v)
+    return d
+
+
+def state_path():
+    """Newest state file — the cycle whose `pre` most recently ran."""
+    files = sorted(glob.glob(STATE_GLOB), key=os.path.getmtime)
+    return files[-1] if files else None
+
+
+def phase_pre():
+    s = sample()
+    path = f"/run/battery-drain.{os.getpid()}-{int(s['wall'])}.state"
+    write_state(path, {f"pre_{k}": v for k, v in s.items()})
+
+
+def phase_post():
+    # Must be fast and must not block: user.slice is still frozen.
+    path = state_path()
+    if not path:
+        return
+    st = read_state(path)
+    s = sample()
+    st.update({f"post_{k}": v for k, v in s.items()})
+    write_state(path, st)
+    # Detached: finish must wait for chrony, and nothing may delay the thaw.
+    # No --unit=: let systemd auto-name, so overlapping cycles cannot clash.
+    os.spawnvp(os.P_NOWAIT, "systemd-run", [
+        "systemd-run", "--no-block", "--on-active=90",
+        os.path.abspath(__file__), "finish", path,
+    ])
+
+
+def phase_finish(path):
+    if not path or not os.path.exists(path):
+        path = state_path()
+    if not path:
+        return
+    st = read_state(path)
+    if "post_wall" not in st:
+        os.unlink(path)          # suspend never came back far enough; nothing to say
+        return
+
+    now_wall = time.time()
+    now_mono = time.clock_gettime(time.CLOCK_MONOTONIC)
+
+    # CLOCK_MONOTONIC does not tick during S3, so the difference between
+    # elapsed wall time and elapsed monotonic time IS the time spent asleep.
+    slept = (now_wall - st["pre_wall"]) - (now_mono - st["pre_mono"])
+
+    d_uah = st["pre_charge_uah"] - st["post_charge_uah"]
+    volts = (st["pre_voltage_uv"] + st["post_voltage_uv"]) / 2 / 1e6
+    d_wh = d_uah / 1e6 * volts
+
+    if slept < 60:
+        # Brief lid-close-and-reopen. Nothing measurable, and this machine gets
+        # a lot of them -- logging would bury the rows that matter.
+        os.unlink(path)
+        return
+
+    if abs(d_uah) < 20000:
+        # Gauge resolution is ~1 mAh and it has a current-sense deadband of a
+        # few mA; under ~20 mAh the reading is noise, not a measurement.
+        note = "  (below gauge resolution -- upper bound only)"
+    else:
+        note = ""
+
+    mw = d_wh / (slept / 3600) * 1000 if slept > 0 else float("nan")
+    with open(LOG, "a") as f:
+        f.write(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')}  "
+            f"slept={slept / 3600:7.3f}h  "
+            f"drain={d_uah / 1000:7.1f}mAh ({d_wh * 1000:7.1f}mWh)  "
+            f"{mw:8.1f}mW{note}\n"
+        )
+    os.unlink(path)
+
+
+if __name__ == "__main__":
+    phase = sys.argv[1] if len(sys.argv) > 1 else ""
+    arg = sys.argv[2] if len(sys.argv) > 2 else None
+    try:
+        if phase == "pre":
+            phase_pre()
+        elif phase == "post":
+            phase_post()
+        elif phase == "finish":
+            phase_finish(arg)
+    except (OSError, KeyError, ValueError, IndexError):
+        pass  # never fail a suspend over bookkeeping

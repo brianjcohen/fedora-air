@@ -1,0 +1,7 @@
+[Unit]
+Description=Downgrade WPA3 wifi profiles to WPA2 for the Broadcom wl driver
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wl-fix-wifi-profiles

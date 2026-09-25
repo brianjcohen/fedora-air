@@ -1,0 +1,26 @@
+#!/bin/sh
+# Broadcom wl (BCM4360) doesn't survive S3 cleanly: after resume it associates
+# but authentication times out. Unload before sleep, reload after.
+#
+# wpa_supplicant must be restarted after the reload: it stays bound to the
+# interface that disappeared and falls back to the old wext driver, where every
+# scan fails with "ioctl[SIOCSIWSCAN]: Inappropriate ioctl for device" and no
+# networks are listed. NetworkManager re-registers with the new supplicant.
+#
+# Local workaround, not packaged -- delete this file to undo.
+case "$1" in
+    pre)
+        /usr/sbin/modprobe -r wl
+        ;;
+    post)
+        /usr/sbin/modprobe wl || exit 0
+        # Wait for the interface to come back before restarting the supplicant.
+        i=0
+        while [ $i -lt 50 ] && [ ! -e /sys/class/net/wlp3s0 ]; do
+            sleep 0.1
+            i=$((i + 1))
+        done
+        /usr/bin/systemctl restart wpa_supplicant
+        ;;
+esac
+exit 0

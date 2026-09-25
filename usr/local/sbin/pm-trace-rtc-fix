@@ -1,0 +1,27 @@
+#!/bin/sh
+# Repair the RTC that pm_trace clobbered during the last suspend.
+#
+# chrony's "rtcsync" already does this, but only within its 11-minute cycle, so
+# a reboot in that window would boot with the garbage date pm_trace left behind
+# (seen: 2004-04-20). This waits for chronyd to actually step the clock, then
+# writes the corrected time back immediately.
+#
+# Launched detached by the pm-trace sleep hook, so it can never delay a resume.
+# Local, not packaged -- delete this file to undo.
+i=0
+while [ $i -lt 60 ]; do
+    off=$(chronyc tracking 2>/dev/null | awk '/^System time/ {print $4}')
+    case "$off" in
+        ''|*[!0-9.]*) ;;                      # no answer yet, or not a bare number
+        *)
+            # Synchronised to within a second: the post-resume step has landed.
+            if awk -v o="$off" 'BEGIN{exit !(o < 1)}'; then
+                /usr/sbin/hwclock --systohc
+                exit 0
+            fi
+            ;;
+    esac
+    sleep 5
+    i=$((i + 1))
+done
+exit 0

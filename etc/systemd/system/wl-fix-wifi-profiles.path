@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for WPA3 wifi profiles the Broadcom wl driver can't use
+
+[Path]
+PathChanged=/etc/NetworkManager/system-connections
+PathChanged=/run/NetworkManager/system-connections
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,25 @@
+#!/bin/bash
+# The Broadcom wl driver can't do WPA3 (SAE) or PMF, but plasma-nm/NetworkManager
+# still create SAE profiles for WPA2/WPA3 transition networks, which then never
+# connect. Rewrite any such profile to WPA2-PSK with PMF off.
+# Triggered by wl-fix-wifi-profiles.path. Local workaround -- see that unit.
+
+# Only act while every wifi device is on wl; a WPA3-capable adapter would
+# lose WPA3 otherwise.
+wifi_drivers=$(nmcli -g GENERAL.DRIVER,GENERAL.TYPE device show 2>/dev/null |
+    paste - - - | awk -F'\t' '$2 == "wifi" { print $1 }' | sort -u)
+[ "$wifi_drivers" = "wl" ] || exit 0
+
+nmcli -g UUID,TYPE connection show | while IFS=: read -r uuid type; do
+    [ "$type" = "802-11-wireless" ] || continue
+    [ "$(nmcli -g 802-11-wireless-security.key-mgmt connection show "$uuid")" = "sae" ] || continue
+
+    name=$(nmcli -g connection.id connection show "$uuid")
+    nmcli connection modify "$uuid" wifi-sec.key-mgmt wpa-psk wifi-sec.pmf disable || continue
+    logger -t wl-fix-wifi-profiles "switched '$name' from WPA3 (SAE) to WPA2-PSK"
+
+    # If it's mid-activation with the old settings, restart it so the fix applies now.
+    if nmcli -g UUID connection show --active | grep -qx "$uuid"; then
+        nmcli --wait 0 connection up "$uuid" >/dev/null 2>&1
+    fi
+done

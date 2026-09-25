@@ -1,0 +1,61 @@
+#!/bin/sh
+# Instrumentation for the 2026-09-17 resume hang, where the kernel never
+# finished resuming: nothing was written to disk after "PM: suspend entry", so
+# the journal could not say which device wedged.
+#
+# pm_trace stores a hash of the last device-resume callback in the RTC, which
+# survives the hard power-cycle such a hang forces. After a hang, reboot and
+# run: pm-trace-result
+#
+#   ARMED ONLY WHEN /etc/pm-trace.enabled EXISTS.
+#
+#     arm:     sudo touch /etc/pm-trace.enabled
+#     disarm:  sudo rm -f /etc/pm-trace.enabled
+#
+# DISARMED 2026-09-18. The cost is paid on every wake; the benefit only on a
+# hang, which has not recurred in six cycles since facetimehd was taken out of
+# the resume path (two of them longer than the ~3.9h suspend that failed).
+#
+# The cost, for whoever is deciding whether to re-arm: pm_trace clobbers the
+# RTC, which is the persistent clock timekeeping_resume() reads, so the system
+# clock does not advance across a suspend AT ALL -- a 9.46h suspend came back
+# reading the moment the lid closed. Journal timestamps across a suspend are
+# therefore unreliable and `uptime` reports awake time only. That degrades the
+# evidence for any *other* incident, which is why it is off by default. To read
+# such a journal anyway: `journalctl -o short-monotonic`, and take the true
+# sleep duration from chrony's "was stepped by N seconds".
+#
+# The marker file is what makes a trace readable: the kernel decodes the RTC
+# into a "Magic number" line on every single boot, so those are meaningless
+# noise unless a resume actually failed. It is written before the suspend (the
+# kernel syncs filesystems on the way down, so it reaches disk) and removed on
+# every successful resume -- if it survives to the next boot, the resume never
+# completed and that boot's Magic number is real.
+#
+# Local, not packaged -- delete this file to undo (and drop no_console_suspend
+# from the kernel cmdline).
+MARKER=/var/lib/pm-trace-armed
+ENABLE=/etc/pm-trace.enabled
+
+[ -e "$ENABLE" ] || exit 0
+
+case "$1" in
+    pre)
+        echo 1 > /sys/power/pm_trace
+        echo 1 > /sys/power/pm_debug_messages
+        date -Iseconds > "$MARKER"
+        ;;
+    post)
+        # Must not block: user.slice stays frozen until every post hook returns.
+        rm -f "$MARKER"
+        # The two-argument form is essential. A bare "chronyc makestep" steps
+        # using the offset chronyd holds *right now*, and at resume there is no
+        # network yet (wl is still reloading), so it is a silent no-op. This
+        # re-arms stepping for the next 5 updates, which land once wifi is back.
+        /usr/bin/chronyc makestep 0.1 5 >/dev/null 2>&1 || true
+        # Detached, because it waits for that step before repairing the RTC.
+        /usr/bin/systemd-run --no-block --unit=pm-trace-rtc-fix \
+            /usr/local/sbin/pm-trace-rtc-fix >/dev/null 2>&1 || true
+        ;;
+esac
+exit 0

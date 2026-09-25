@@ -1,0 +1,35 @@
+#!/bin/bash
+# Arm LID0 as a wake source only when the lid is actually closed.
+#
+# Why: this machine's DSDT arms lid wake via LID0._PSW, which sets the EC's EWLO
+# ("wake on lid open") bit as the machine goes down. With the lid already open that
+# condition is satisfied immediately and the EC fires GPE 0x70 ~6s later, so every
+# lid-open suspend -- i.e. every idle/menu-triggered sleep -- died after 6-7s and the
+# machine sat awake draining the battery. Measured 2026-09-24: lid open + LID0 enabled
+# = 6s and 7s; lid open + LID0 disabled = slept until woken. Lid-closed suspends are
+# unaffected (119h observed) and must keep lid wake, or opening the lid won't resume.
+#
+# Consequence: after an idle suspend with the lid open, closing the lid does not arm
+# lid wake retroactively -- use the power button. Keyboard/trackpad (XHC1) stays armed.
+#
+# Both branches are a few file reads; nothing here may block the thaw (runbook §5).
+
+lid_state() { cat /proc/acpi/button/lid/*/state 2>/dev/null | awk '{print $2; exit}'; }
+lid0_wake() { awk '$1 == "LID0" { gsub(/\*/, "", $3); print $3; exit }' /proc/acpi/wakeup; }
+set_lid0_wake() {  # /proc/acpi/wakeup is a toggle, so only write when it differs
+    [ "$(lid0_wake)" != "$1" ] && echo LID0 > /proc/acpi/wakeup
+}
+
+case "$1" in
+    pre)
+        if [ "$(lid_state)" = closed ]; then
+            set_lid0_wake enabled
+        else
+            set_lid0_wake disabled
+        fi
+        ;;
+    post)
+        set_lid0_wake enabled   # back to the default while awake
+        ;;
+esac
+exit 0

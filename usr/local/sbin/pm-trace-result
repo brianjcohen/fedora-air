@@ -1,0 +1,34 @@
+#!/bin/sh
+# Report what /usr/lib/systemd/system-sleep/pm-trace recorded in the RTC.
+# Run this after rebooting from a resume hang.
+#
+# Local, not packaged -- delete this file to undo.
+MARKER=/var/lib/pm-trace-armed
+
+echo "pm_trace armed for the next suspend: $(cat /sys/power/pm_trace 2>/dev/null || echo '?')"
+
+if [ ! -e "$MARKER" ]; then
+    echo
+    echo "No trace to read: the last suspend resumed successfully (or there"
+    echo "hasn't been one since the hook was installed)."
+    echo
+    echo "Note that 'Magic number' lines appear in dmesg on EVERY boot -- the"
+    echo "kernel always decodes whatever is in the RTC -- so ignore them unless"
+    echo "this script says there is a real trace."
+    exit 0
+fi
+
+echo
+echo "A suspend was armed at $(cat "$MARKER") and never completed its resume."
+echo "This boot's decoded RTC hash is therefore a real trace:"
+echo
+journalctl -b 0 -k --no-pager | grep -iE 'Magic number|hash matches|RTC time' | sed 's/^/  /'
+echo
+echo "'<dev>: hash matches' names the last device whose resume callback ran"
+echo "before the hang -- cross-check with 'lspci -s <addr>' where it is a PCI"
+echo "address. Expect two or three candidates; the hash space is small, so some"
+echo "are false positives. A 'hash matches drivers/...' line points at the code"
+echo "path rather than a device."
+echo
+echo "Clear the marker once you've read this, so the next run is meaningful:"
+echo "  rm $MARKER"
