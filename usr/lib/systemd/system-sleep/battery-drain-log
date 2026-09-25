@@ -39,17 +39,23 @@ import time
 STATE_GLOB = "/run/battery-drain.*.state"
 LOG = "/var/log/suspend-drain.log"
 BAT = "/sys/class/power_supply/BAT0"
+AC = "/sys/class/power_supply/ADP1"
 
 
 def sample():
-    def rd(name):
-        with open(os.path.join(BAT, name)) as f:
+    def rd(base, name):
+        with open(os.path.join(base, name)) as f:
             return int(f.read().strip())
     return {
         "wall": time.time(),
         "mono": time.clock_gettime(time.CLOCK_MONOTONIC),
-        "charge_uah": rd("charge_now"),
-        "voltage_uv": rd("voltage_now"),
+        "charge_uah": rd(BAT, "charge_now"),
+        "voltage_uv": rd(BAT, "voltage_now"),
+        # A cycle spent on the charger measures the charger, not the platform:
+        # those rows came out as drain=-2713mAh, indistinguishable from real
+        # data except by being absurd. Sampled at both ends so `finish` can say
+        # so instead of logging nonsense.
+        "ac_online": rd(AC, "online"),
     }
 
 
@@ -123,6 +129,20 @@ def phase_finish(path):
     if slept < 60:
         # Brief lid-close-and-reopen. Nothing measurable, and this machine gets
         # a lot of them -- logging would bury the rows that matter.
+        os.unlink(path)
+        return
+
+    # On the charger at either end, the gauge is tracking charge current, so no
+    # drain figure is meaningful. Say that rather than emitting a plausible
+    # -30W row -- the cycle itself is still worth a line.
+    if st.get("pre_ac_online") or st.get("post_ac_online"):
+        with open(LOG, "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')}  "
+                f"slept={slept / 3600:7.3f}h  "
+                f"drain=       -             -       "
+                f"      -  (charger connected -- not a drain measurement)\n"
+            )
         os.unlink(path)
         return
 

@@ -20,6 +20,7 @@ Files mirror their real filesystem paths, so installing is a tree copy:
 ```
 fedora-air-runbook.md                                  the runbook
 install.sh                                             copies the files below into place
+check-drift.sh                                         diffs the files below against the system
 usr/lib/systemd/system-sleep/
     wl-reload            unload/reload the Broadcom wl driver around suspend
     facetimehd-reload    take the camera driver out of the resume path
@@ -47,6 +48,13 @@ sudo ./install.sh
 `install.sh` refuses to run on any model other than `MacBookAir7,2` unless forced, is safe to
 re-run, and installs **only** these files — it does not install packages, build the camera driver
 or touch the kernel command line. It prints what remains to be done by hand.
+
+`check-drift.sh` compares every file here against its installed copy, so the repo cannot quietly
+fall out of step with the machine:
+
+```sh
+sudo ./check-drift.sh
+```
 
 Then work through the runbook: §3 wifi, §4 camera, §9 health check. Expect roughly half an hour
 of building for the camera and a reboot to confirm the result.

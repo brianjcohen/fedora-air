@@ -74,6 +74,7 @@ reports taken from this machine.
 | 2026-09-24 19:20 | Runbook moved to the desktop user's home dir, sanitized for publication, open threads (§11) collected | agent session |
 | 2026-09-24 19:30 | §4 rewritten as a reproducible build/install procedure; intro states the reuse goal | agent session |
 | 2026-09-24 19:40 | Runbook and all local files collected into the `fedora-air` git repo with `install.sh` | agent session |
+| 2026-09-24 20:27 | `wl-fix-wifi-profiles` verified end to end; printer duplex default set; `battery-drain-log` now labels charging cycles; §3/§7 rewritten as procedures; `check-drift.sh` added | agent session |
 
 ---
 
@@ -220,7 +221,18 @@ disabled, then bounces the connection if it's mid-activation.
 It deliberately no-ops if any wifi device is present that is **not** on `wl`, so plugging in a
 decent adapter doesn't silently strip WPA3 from it.
 
-Enabled via `wl-fix-wifi-profiles.path`. Not yet tested end to end.
+Enabled via `wl-fix-wifi-profiles.path`. **Verified end to end 2026-09-24:** adding a throwaway
+SAE profile triggered the path unit, the service rewrote it to `wpa-psk` with PMF disabled within
+a second and logged `switched 'zz-sae-test' from WPA3 (SAE) to WPA2-PSK` via `logger`, and the
+real profile and live connection were untouched. To repeat the test:
+
+```sh
+sudo nmcli connection add type wifi con-name zz-sae-test ssid ZZ-SAE-TEST \
+    wifi-sec.key-mgmt sae wifi-sec.psk 'testtest123' autoconnect no
+nmcli -g 802-11-wireless-security.key-mgmt connection show zz-sae-test   # -> wpa-psk
+journalctl -t wl-fix-wifi-profiles -n 3
+sudo nmcli connection delete zz-sae-test
+```
 
 ### `/etc/NetworkManager/conf.d/91-wl-no-pmf.conf`
 
@@ -637,10 +649,12 @@ above arrived on 2026-09-24:
 2026-09-24 15:56:15  slept=119.039h  drain=   75.0mAh (  555.2mWh)       4.7mW
 ```
 
-**Rows from cycles with the charger connected are garbage,** e.g.
-`drain=-2713.0mAh (-21202.1mWh) -26803.9mW`. The script records no AC state, so read a negative
-or absurd row as "it was charging", not as data. Short cycles at a low state of charge also
-read high (one 23-minute row claims 754 mW). §11.
+**Cycles with the charger connected are now labelled rather than measured** *(fixed
+2026-09-24)*: the script samples `/sys/class/power_supply/ADP1/online` at both ends and writes
+`(charger connected -- not a drain measurement)` instead of a drain figure. Rows written before
+that fix show absurd negatives such as `drain=-2713.0mAh … -26803.9mW`; read those as "it was
+charging", not as data. Short cycles at a low state of charge also read high — one 23-minute row
+claims 754 mW — and are still logged as-is.
 
 If drain ever does climb into the hundreds of mW, start with
 `journalctl -b 0 | grep -i 'PM: '` and the wakeup sources in `/proc/acpi/wakeup`.
@@ -772,42 +786,72 @@ zram swap is configured. **Do not install TLP** — it fights tuned.
 
 ### Printing — HP LaserJet MFP (M232-M237 series)
 
-CUPS queue added 2026-09-17, system default. `lpstat -v` shows the queue name and device URI;
-`lpstat -t` shows its state.
+Driverless over the network; queue added 2026-09-17 and set as system default. **Do not install
+an HP driver for this.** The printer advertises AirPrint and Mopria 2.2 with `URF` and PCLm, so
+CUPS' built-in `everywhere` model drives it. `hplip` is installed on this machine but plays no
+part in the queue and is not needed to print.
 
 | | |
 |---|---|
 | Model | HP LaserJet MFP M234sdw (reports as M232-M237), mono, duplex, scanner |
-| Address | mDNS name `<printer>.local` on the LAN, DHCP address |
+| Address | mDNS name `<printer>.local`, DHCP address |
 | Admin UI | `http://<printer>.local/` |
 
-**Driverless — do not install an HP driver for this.** The printer advertises AirPrint and
-Mopria 2.2 with `URF` and PCLm, so it works through CUPS' `everywhere` model. `hplip` is
-installed but is not used by this queue and is not needed for printing.
+**Adding it.**
 
 ```sh
-lpinfo -v | grep dnssd            # the real URI, including the printer's uuid= parameter
-lpadmin -p <queue> -E -v '<dnssd-uri>' -m everywhere -o printer-is-shared=false
-lpadmin -d <queue>                # system default
+sudo dnf install -y cups avahi           # both are in a stock Fedora KDE install
+lpinfo -v | grep -iE 'dnssd|ipp'         # find the printer; copy the URI it prints
+sudo lpadmin -p <queue> -E -v '<uri>' -m everywhere -o printer-is-shared=false
+sudo lpadmin -d <queue>                  # make it the system default
+sudo lpadmin -p <queue> -o Duplex=DuplexNoTumble   # two-sided by default (see below)
 ```
 
-The device URI is **`dnssd://`, deliberately not the IP**. The printer is on DHCP, so a
-hardcoded `ipp://<ip>/...` would break the day its lease changes. The dnssd URI is
-resolved via mDNS at print time — which means **`avahi-daemon` must stay running** or printing
-breaks.
+**Never use a hardcoded `ipp://<ip>/...` URI.** The printer is on DHCP, so an address-based URI
+breaks the day its lease changes. Both `dnssd://` and a hostname-based `ipp://<printer>.local:631/`
+URI are resolved by mDNS at print time, which means **`avahi-daemon` must stay running** or
+printing stops working.
 
-Available to all local users with no extra configuration: the queue lives in
-the system-wide cupsd, and the stock `<Limit Create-Job Print-Job …> Order deny,allow` policy
-in `/etc/cups/cupsd.conf` permits any local user to submit. `printer-is-shared=false` keeps it
-from being re-advertised to the network — the printer already advertises itself.
+> This queue was created with a `dnssd://…` URI, and CUPS has since rewritten it to
+> `ipp://<printer>.local:631/ipp/print`. Both are fine — the name, not an address — so don't
+> "fix" it back. Read the live value with `lpstat -v` rather than trusting either this document
+> or your memory.
+
+**Duplex, and a trap.**
+
+**`-o sides-default=two-sided-long-edge` silently does nothing on this queue.** It is accepted,
+it is not stored, and `lpoptions` keeps reporting one-sided; an earlier version of this runbook
+recommended exactly that. The queue has a generated PPD, so the default lives in the PPD's
+`Duplex` option instead:
+
+```sh
+sudo lpadmin -p <queue> -o Duplex=DuplexNoTumble    # long-edge (portrait)
+grep '^\*DefaultDuplex' /etc/cups/ppd/<queue>.ppd  # -> DuplexNoTumble
+lpoptions -p <queue> | tr ' ' '\n' | grep sides    # -> sides=two-sided-long-edge
+```
+
+Set that way 2026-09-24. `Duplex=None` restores one-sided. Other defaults are Letter and `Gray`.
+
+**Verify.**
+
+```sh
+lpstat -t | head -5             # queue idle and enabled, and the default destination
+lpstat -v                       # the live device URI
+systemctl is-active avahi-daemon cups
+echo test | lp                  # prints one page on the default queue
+```
+
+**Notes.**
+
+Available to all local users with no extra configuration: the queue lives in the system-wide
+cupsd, and the stock `<Limit Create-Job Print-Job …> Order deny,allow` policy in
+`/etc/cups/cupsd.conf` permits any local user to submit. `printer-is-shared=false` keeps this
+machine from re-advertising a printer that already advertises itself.
 
 `cups-browsed` is disabled and should stay that way; with a permanent queue it would create
 duplicate temporary queues in print dialogs.
 
-Defaults are Letter, `Gray`, `Duplex=None`. Duplex hardware is present, so to make two-sided
-the default: `lpadmin -p <queue> -o sides-default=two-sided-long-edge`.
-
-Remove with `lpadmin -x <queue>`.
+Remove the queue with `sudo lpadmin -x <queue>`.
 
 ### Trackpad — left at libinput defaults, deliberately
 
@@ -891,6 +935,7 @@ for f in /usr/lib/systemd/system-sleep/{wl-reload,facetimehd-reload,pm-trace,lid
   [ -e "$f" ] || echo "MISSING: $f"
 done
 
+sudo /path/to/repo/check-drift.sh                  # repo copies still match the system
 systemctl is-enabled wl-fix-wifi-profiles.path     # expect: enabled
 dkms status                                        # expect: facetimehd ... installed
 sudo pm-trace-result                               # expect: "No trace to read" when healthy
@@ -960,17 +1005,26 @@ Things this runbook raised and nothing ever came back to. Listed worst-consequen
 
 | # | Thread | Where | Status / what would close it |
 |---|---|---|---|
-| 1 | **Resume hang never root-caused.** `facetimehd` is a suspect on circumstantial evidence only; the hang has not recurred since it left the resume path, which is consistent with a fix *and* with the hang simply being rare. | §5 | Unresolved by design — you cannot prove absence. `pm_trace` is disarmed, so a recurrence yields nothing; re-arm (`sudo touch /etc/pm-trace.enabled`) before trusting the machine somewhere inconvenient. |
-| 2 | **`wl-fix-wifi-profiles` has never been tested end to end.** Installed 2026-09-17 and marked "not yet tested"; no SAE profile has been created since, so the path unit has never actually fired. | §3 | Create a throwaway SAE profile, confirm the unit rewrites it to `wpa-psk` within a second, then delete it. Until then, assume it does not work. |
-| 3 | **The MT7921AU adapter was never bought.** The exit plan retires four of the local workarounds and the security-mitigation hole in one purchase, and has sat untouched since 2026-09-17. | §3 | Buy on chipset (`MT7921` must appear in the listing), confirm `lsusb` shows `0e8d:7961`, then work through the §10 wifi rollback. |
-| 4 | **`battery-drain-log` writes nonsense for cycles where the charger was connected** — negative drains of thousands of mAh. It records no AC state, so bad rows are indistinguishable from real ones except by being absurd. | §5 | Read `/sys/class/power_supply/ADP1/online` (or `AC`) at both ends; skip the row, or tag it, when AC was present at either end. |
-| 5 | **The ~5 mW drain figure conflicts with Apple's ~75 mW standby implication** by about 15×, with no explanation for the gap. | §5 | Cross-check the gauge against wall-clock state of charge over a week-long suspend, or against `energy_now` rather than `charge_now`. |
-| 6 | **Thunderbolt idle power was never measured on this machine.** The ~2 W figure is upstream's estimate for an un-suspended Falcon Ridge controller, not an observation here. | §7 | Run the `power_now` loop with the screen dim and nothing running. Under ~6 W there is nothing to chase and the note can be closed. |
-| 7 | **`lid-wake-guard`'s lid-closed path has not been exercised on a real cycle.** The logic and a dry run are verified, and lid-open sleeps now stick, but no lid-close suspend has happened since it was installed on 2026-09-24. | §5 | Close the lid, wait a minute, open it: it should wake. If it does not, `grep ^LID0 /proc/acpi/wakeup` during a suspend is the thing to check. |
-| 8 | **The chrony/RTC repair path is dead code while `pm_trace` is disarmed.** `makestep 0.1 5` plus `pm-trace-rtc-fix` exist only to undo damage `pm_trace` does, and have not run since 2026-09-18. | §6 | Leave as a matched pair with `pm_trace`, or delete both together. Do not delete one alone. |
-| 9 | **`no_console_suspend` was never validated** and is believed inert on this machine, yet it sits on the cmdline of all three BLS entries. | §6 | Harmless either way; remove per §10 if you want a clean cmdline. |
-| 10 | **Duplex was never made the default** on the printer despite the hardware supporting it and the one-liner being written down. | §7 | `lpadmin -p <queue> -o sides-default=two-sided-long-edge`. |
-| 11 | **The older 6.19.10 kernel has never been verified.** `wl` and `facetimehd` are built per-kernel, and that entry has not been booted since they were installed — it may have no wifi and no camera. | §9 | Either boot it once and run the §9 checks, or remove it (`dnf remove kernel-core-6.19.10-300.fc44`) so it cannot be chosen by accident during a bad boot. |
+| 1 | **Resume hang never root-caused.** `facetimehd` is a suspect on circumstantial evidence only; the hang has not recurred since it left the resume path, which is consistent with a fix *and* with the hang simply being rare. | §5 | **Open, and unresolvable by design** — you cannot prove absence. `pm_trace` is disarmed, so a recurrence yields nothing; re-arm (`sudo touch /etc/pm-trace.enabled`) before trusting the machine somewhere inconvenient. |
+| 2 | **The ~5 mW drain figure conflicts with Apple's ~75 mW standby implication** by about 15×, with no explanation for the gap. | §5 | **Open.** Cross-check the gauge against state of charge over a week-long suspend, or against `energy_now` rather than `charge_now`. |
+| 3 | **The MT7921AU adapter was never bought.** The exit plan retires four of the local workarounds and the security-mitigation hole in one purchase, untouched since 2026-09-17. | §3 | **Open.** Buy on chipset (`MT7921` must appear in the listing), confirm `lsusb` shows `0e8d:7961`, then work through the §10 wifi rollback. |
+| 4 | **Thunderbolt idle power was never measured on this machine.** The ~2 W figure is upstream's estimate for an un-suspended Falcon Ridge controller, not an observation here. | §7 | **Open, and it needs the right conditions:** on battery (`power_now` measures the charger otherwise), screen dim, nothing running. Under ~6 W there is nothing to chase. |
+| 5 | **`lid-wake-guard`'s lid-closed path has not been exercised on a real cycle.** The logic and a dry run are verified and lid-open sleeps now stick, but no lid-close suspend has happened since it was installed. | §5 | **Open.** Close the lid, wait a minute, open it: it should wake. If it does not, check `grep ^LID0 /proc/acpi/wakeup` during a suspend. |
+| 6 | **The chrony/RTC repair path is dead code while `pm_trace` is disarmed.** `makestep 0.1 5` plus `pm-trace-rtc-fix` exist only to undo damage `pm_trace` does, and have not run since 2026-09-18. | §6 | **Open decision, no action needed.** Keep as a matched pair with `pm_trace`, or delete both together — never one alone. |
+| 7 | **`no_console_suspend` was never validated** and is believed inert, yet it sits on the cmdline of all three BLS entries. | §6 | **Open decision.** Harmless either way; remove per §10 for a clean cmdline. |
+| 8 | **The older 6.19.10 kernel would boot without wifi or camera.** *(Confirmed by inspection 2026-09-24: no `extra/`, empty `updates/`, no `kmod-wl` for it, and DKMS has built `facetimehd` only for 7.2.5.)* | §9 | **Half closed.** What remains is a decision: boot it once and build both modules for it, or remove it (`dnf remove kernel-core-6.19.10-300.fc44`) so a bad boot cannot land on a kernel with no network. |
+
+**Closed 2026-09-24:**
+
+- **`wl-fix-wifi-profiles` is no longer untested** — a throwaway SAE profile was rewritten to
+  `wpa-psk` within a second, logged, with the live connection untouched (§3).
+- **`battery-drain-log` no longer writes nonsense for charging cycles** — it samples AC state at
+  both ends and labels such rows instead of emitting a plausible -30 W figure (§5).
+- **Duplex is the printer's default** — via the PPD's `Duplex` option, because the previously
+  documented `sides-default` form is accepted and silently ignored on this queue (§7).
+- **S3 drain has a real measurement** — ~5 mW, from a 119-hour suspend corroborated by two
+  shorter cycles (§5).
+- **Idle sleep sticks** — `lid-wake-guard`, the subject of this evening's diagnosis (§5).
 
 ---
 
