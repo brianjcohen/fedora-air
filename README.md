@@ -62,6 +62,12 @@ of building for the camera and a reboot to confirm the result.
   since the camera driver left the resume path, but the cause was never proven. §11 of the runbook
   lists that and everything else that was never followed up.
 
+## License
+
+[MIT](LICENSE). The scripts are small and the workarounds they implement are documented in public
+bug reports and upstream wikis; use them however you like. The camera driver and firmware
+extractor are separate upstream projects with their own licenses.
+
 ## Notes
 
 Written against Fedora 44, kernel 7.2.x, KDE Plasma on Wayland. Paths such as
