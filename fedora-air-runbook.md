@@ -76,6 +76,7 @@ reports taken from this machine.
 | 2026-09-24 19:40 | Runbook and all local files collected into the `fedora-air` git repo with `install.sh` | agent session |
 | 2026-09-24 20:27 | `wl-fix-wifi-profiles` verified end to end; printer duplex default set; `battery-drain-log` now labels charging cycles; §3/§7 rewritten as procedures; `check-drift.sh` added | agent session |
 | 2026-09-26 11:20 | RTL8821CU USB dongle added: WPA3/SAE profile, power save off, made primary; all wifi profiles bound to their interfaces after they swapped devices across a suspend | agent session |
+| 2026-09-26 11:35 | Internal card taken out of service: `autoconnect no` on both `wl` profiles, device disconnected, module left loaded as fallback | agent session |
 
 ---
 
@@ -346,6 +347,24 @@ ip route show default                              # dongle's route has the lowe
 **Suspend.** `rtw88_8821cu` survives S3 on this machine: across two cycles of 123 s and 92 s the
 dongle re-associated on its own with no hook, no module reload and working routing — unlike `wl`,
 which needs §3's sleep hook. It is not in any sleep hook and does not appear to need one.
+
+**Running on the dongle alone, without removing `wl`.** Two radios associated at once wastes
+airtime and battery for no benefit. Stop the internal card connecting, but leave it installed as a
+fallback:
+
+```sh
+sudo nmcli connection modify '<ssid>' connection.autoconnect no      # each wl profile
+sudo nmcli device disconnect <wl-iface>
+```
+
+To fall back later — dongle lost, or a network the dongle dislikes — bring it up explicitly:
+`sudo nmcli connection up '<ssid>'`.
+
+**Don't bother unloading the `wl` module for power.** Measured on battery, eight samples each:
+7.84 W with `wl` loaded and disconnected, 7.80 W with it unloaded — a 0.04 W difference on a
+machine drawing 7.8 W, i.e. nothing. An idle, unassociated card costs approximately zero, and the
+`wl-reload` sleep hook would reload it on the next resume anyway. Leaving it loaded keeps the
+fallback to one `nmcli` command.
 
 **Retiring `wl` altogether** is the end state a dongle buys: it removes the sleep hook, the profile
 watcher, the PMF default and the mitigation hole in one step. Commands are in §10 — read the
@@ -958,8 +977,16 @@ To decide whether it's worth caring about, measure real idle draw with the scree
 nothing running:
 
 ```sh
-while :; do awk '{printf "%.2f W\n", $1/1e6}' /sys/class/power_supply/BAT0/power_now; sleep 5; done
+# This battery exposes no power_now, so compute watts from current and voltage:
+B=/sys/class/power_supply/BAT0
+while :; do
+  awk -v c="$(cat $B/current_now)" -v v="$(cat $B/voltage_now)" \
+      'BEGIN{printf "%.2f W\n", c/1e6 * v/1e6}'
+  sleep 5
+done
 ```
+
+It reads zero while charging, so unplug first.
 
 Under ~6 W, nothing to chase. ~8 W or more, the Thunderbolt gap is probably showing.
 
@@ -1091,7 +1118,7 @@ Things this runbook raised and nothing ever came back to. Listed worst-consequen
 | 3 | **`wl` is still installed and tainting the kernel**, although a working dongle now carries the traffic. Retiring it would close the mitigation hole and three workarounds, at the cost of having no wifi whenever the dongle is absent. | §3, §10 | **Open decision.** Run for a while on the dongle first; the failure mode of getting this wrong is a laptop with no network and no ethernet port. |
 | 4 | **The MT7921AU was never measured.** The claim that it would beat the RTL8821CU's ~75 Mbit/s is inference from 2x2 ax + USB 3 + `mt76`, not data, and this machine's USB 3 complex is already known to misbehave for Thunderbolt. | §3 | **Open.** ~$25 settles it. Until then the runbook's recommendation of it over the Realtek rests on reasoning only. |
 | 5 | **One suspend woke after 11 seconds** on 2026-09-26, 13 s after a wifi reconfiguration, with no wake source recorded in `/sys/class/wakeup`. The two cycles either side of it slept their full duration and woke on the RTC alarm as expected. | §5 | **Open, unexplained, not reproduced.** Suspect in-flight USB/DHCP activity. If early wakes recur with the dongle plugged in, snapshot `/sys/class/wakeup` before and after and diff — that is what identified the lid-wake bug. |
-| 6 | **Thunderbolt idle power was never measured on this machine.** The ~2 W figure is upstream's estimate for an un-suspended Falcon Ridge controller, not an observation here. | §7 | **Open, and it needs the right conditions:** on battery (`power_now` measures the charger otherwise), screen dim, nothing running. Under ~6 W there is nothing to chase. |
+| 6 | **Thunderbolt idle power was never measured on this machine.** The ~2 W figure is upstream's estimate for an un-suspended Falcon Ridge controller, not an observation here. | §7 | **Open, and it needs the right conditions:** on battery, screen dim, nothing running. For reference, this machine drew ~7.8 W on battery with the screen on, a terminal busy and two radios up. Under ~6 W idle there is nothing to chase. |
 | 7 | **`lid-wake-guard`'s lid-closed path has not been exercised on a real cycle.** The logic and a dry run are verified and lid-open sleeps now stick, but no lid-close suspend has happened since it was installed. | §5 | **Open.** Close the lid, wait a minute, open it: it should wake. If it does not, check `grep ^LID0 /proc/acpi/wakeup` during a suspend. |
 | 8 | **The chrony/RTC repair path is dead code while `pm_trace` is disarmed.** `makestep 0.1 5` plus `pm-trace-rtc-fix` exist only to undo damage `pm_trace` does, and have not run since 2026-09-18. | §6 | **Open decision, no action needed.** Keep as a matched pair with `pm_trace`, or delete both together — never one alone. |
 | 9 | **`no_console_suspend` was never validated** and is believed inert, yet it sits on the cmdline of all three BLS entries. | §6 | **Open decision.** Harmless either way; remove per §10 for a clean cmdline. |
