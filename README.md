@@ -61,9 +61,11 @@ of building for the camera and a reboot to confirm the result.
 
 ## What this does not fix
 
-- **WPA3-only networks.** The `wl` driver cannot do SAE at all; a WPA2/WPA3 transition SSID works,
-  WPA3-only does not. The runbook's exit plan is a MediaTek MT7921AU USB adapter, which retires
-  four of these workarounds at once.
+- **WPA3-only networks, on the internal card.** The `wl` driver cannot do SAE at all; a WPA2/WPA3
+  transition SSID works, WPA3-only does not. The fix is a USB adapter with an in-kernel driver,
+  which also retires four of these workarounds — the runbook measures one (Realtek RTL8821CU:
+  works out of the box, real WPA3, survives suspend, but ~75 Mbit/s against the internal card's
+  ~200) and explains which chipsets to buy and which to avoid.
 - **Kernel security mitigations.** `wl` is built without return thunks and weakens Spectre and
   retbleed mitigations system-wide. The kernel says so on every boot.
 - **The resume hang.** One suspend in 2026-09-17 never finished resuming. It has not recurred

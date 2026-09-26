@@ -42,7 +42,7 @@ Suggested order on a fresh install:
 | OS | Fedora Linux 44 (KDE Plasma Desktop Edition), installed 2026-09-16 |
 | Kernel | 7.2.5-200.fc44.x86_64 (6.19.10-300 also installed) |
 | Root | btrfs, subvol=root, on Samsung Apple-slot AHCI SSD |
-| Wifi | Broadcom BCM4360 `14e4:43a0` — proprietary `wl` driver |
+| Wifi | Internal: Broadcom BCM4360 `14e4:43a0`, proprietary `wl`. Added 2026-09-26: Realtek RTL8821CU USB dongle `0bda:c811`, in-kernel `rtw88_8821cu`, now the primary link |
 | Camera | Broadcom 1570 FaceTime HD `14e4:1570` — out-of-tree `facetimehd` |
 | Input | USB keyboard/trackpad (`bcm5974` + `hid_apple`), **not** SPI |
 | Battery | iFixit replacement, 100% of design (53.2 Wh) |
@@ -75,6 +75,7 @@ reports taken from this machine.
 | 2026-09-24 19:30 | §4 rewritten as a reproducible build/install procedure; intro states the reuse goal | agent session |
 | 2026-09-24 19:40 | Runbook and all local files collected into the `fedora-air` git repo with `install.sh` | agent session |
 | 2026-09-24 20:27 | `wl-fix-wifi-profiles` verified end to end; printer duplex default set; `battery-drain-log` now labels charging cycles; §3/§7 rewritten as procedures; `check-drift.sh` added | agent session |
+| 2026-09-26 11:20 | RTL8821CU USB dongle added: WPA3/SAE profile, power save off, made primary; all wifi profiles bound to their interfaces after they swapped devices across a suspend | agent session |
 
 ---
 
@@ -243,32 +244,112 @@ created with PMF on in the first place.
 
 A **WPA3-only** network still cannot work on this card. No workaround exists.
 
-### The exit plan
+### Upgrading to a USB adapter
 
-Buy a USB adapter with a **MediaTek MT7921AU** chipset. Its `mt7921u` driver has been
-in-kernel since 5.18, so it needs no RPMFusion, no DKMS, no rebuild on kernel updates, and it
-does real WPA3/SAE via `mac80211`.
+Everything above exists because the internal card needs `wl`. A USB adapter with an in-kernel
+driver removes the reason for all of it: no RPMFusion, no akmods rebuild per kernel, real
+WPA3/SAE, and no tainted kernel or mitigation hole. **The internal card cannot be replaced** — it
+is an Apple-proprietary module, not M.2 — so a dongle is the only hardware route.
 
-That single purchase retires *all four* of the items above — the sleep hook, the profile
-watcher, the PMF default, and the mitigation hole.
+Keep the `wl` setup working anyway. A dongle you forgot to pack is a machine with no network, and
+`wl` is the fallback if the adapter dies. This model has no ethernet port to recover through.
 
-Buy on chipset, not model name — this is not a theoretical risk. The Fenvi FU-AX1800 is a
-known-good MT7921AU adapter (`morrownr/USB-WiFi` lists it), **but Fenvi also ships AX-1800
-units with a Realtek RTL8852BU**, which needs an out-of-tree DKMS driver and would put you
-straight back where `wl` has you. Same model name, different chip. Require the listing to say
-`MT7921` explicitly.
+**What to buy.** Buy on *chipset*, not model name:
 
-On arrival, verify before trusting it:
+| Chipset | Driver | Notes |
+|---|---|---|
+| **MediaTek MT7921AU** (`0e8d:7961`) | `mt7921u`, in-kernel since 5.18 | First choice: 2x2 802.11ax, USB 3.0. The Fenvi FU-AX1800 is a known-good example (`morrownr/USB-WiFi` lists it). **Unmeasured here** — see below. |
+| **Realtek RTL8821CU** (`0bda:c811`) | `rtw88_8821cu`, in-kernel | In use here since 2026-09-26. Works with zero configuration, does real SAE, survives suspend — but 1x1 802.11ac on USB 2.0, and slower than the internal card. |
+| Realtek RTL8852BU | out-of-tree DKMS | **Avoid.** Puts you straight back where `wl` has you. |
+
+That last row is not theoretical: Fenvi ships AX-1800 units with *either* the MT7921AU or the
+RTL8852BU under the same model name. Require the listing to name the chipset, and if what arrives
+needs a driver disc or a GitHub repo, send it back.
+
+**Measured, RTL8821CU vs the internal card.** Each interface alone (the other disconnected), four
+50 MB downloads from the same server, same AP, 5 GHz, after DHCP settled:
+
+| Interface | Signal | PHY rate | Throughput | Latency (avg / jitter) |
+|---|---|---|---|---|
+| Internal BCM4360, `wl` | −53…−57 dBm | 526 Mbit/s | **~200 Mbit/s** | 17.4 ms / 3.8 ms |
+| RTL8821CU dongle | −58 dBm | 390 Mbit/s | **~75 Mbit/s** | 18.5 ms / 1.9 ms *(power save off)* |
+| RTL8821CU dongle | −58 dBm | 390 Mbit/s | ~75 Mbit/s | 40.7 ms / 35.3 ms *(power save **on**, the default)* |
+
+Two things follow, and both matter more than the headline number:
+
+1. **Disable power save on the dongle or the link feels bad.** With the default on, latency
+   averaged 40 ms with 35 ms of jitter and 104 ms spikes — visible on calls and over SSH. Off, it
+   matches the internal card. Set it per-profile: `802-11-wireless.powersave 2`. It costs battery,
+   since the radio stops idling.
+2. **Throughput is driver-bound, not signal-bound, and cannot be tuned.** 390 Mbit/s of PHY
+   delivering 75 Mbit/s is about 20% efficiency where 50–60% is normal. Ruled out on this machine:
+   RF (−58 dBm, MCS 9), CPU (16% busy across four cores during a transfer), and the USB bus.
+   Neither `iw set power_save off` (55–77 Mbit/s) nor `rtw88_core.disable_lps_deep=1` (52–61) moved
+   it. Don't spend an evening on it.
+
+**Would an MT7921AU do better? Probably substantially, but this is inference, not measurement.**
+It is 2x2 ax rather than 1x1 ac, a USB 3.0 device rather than 2.0, and `mt76` is the better-regarded
+driver — the 20% efficiency above is a `rtw88_usb` characteristic. Against that: this machine's USB 3
+ports hang off the same Falcon Ridge complex that already mishandles Thunderbolt power management
+(§7), so USB 3 throughput here is not a given.
+
+**Whether ~75 Mbit/s matters** depends on what you do. It saturates 4K streaming several times over
+and is invisible for browsing, SSH and normal work. It is noticeable pulling large files off a LAN
+server (~9 MB/s instead of ~25) and on multi-hundred-MB `dnf` upgrades.
+
+**Setting one up.** The adapter should appear with no configuration:
 
 ```sh
-lsusb | grep -i 0e8d:7961              # MT7921AU's USB ID
-ls /sys/class/net/*/device/driver      # want mt7921u
+lsusb                                  # find its USB ID
+ls -l /sys/class/net/*/device/driver   # which driver bound, per interface
+iw phy | grep -i "supports SAE"        # real WPA3 -- wl can never print this
+nmcli device status                    # the new interface, 'disconnected'
 ```
 
-If it needs a driver disc or a GitHub repo, send it back.
+Give it its own profile using SAE rather than the WPA2 downgrade `wl` forces. A lower route metric
+makes it the preferred path while both are connected:
 
-Replacing the internal card is not an option — it's an Apple-proprietary module, not M.2.
+```sh
+sudo nmcli connection add type wifi con-name '<ssid>-usb' ifname <iface> ssid '<ssid>' \
+    wifi-sec.key-mgmt sae wifi-sec.psk '<passphrase>' \
+    802-11-wireless.powersave 2 \
+    ipv4.route-metric 50 ipv6.route-metric 50
+sudo nmcli connection up '<ssid>-usb'
+```
 
+> **Bind every wifi profile to its interface, including the old `wl` ones:**
+> ```sh
+> sudo nmcli connection modify '<ssid>' connection.interface-name <wl-iface>
+> ```
+> **This is not optional, and the failure is nasty.** A profile created without `ifname` is not
+> tied to a device, so when `wl-reload` unloads `wl` during a suspend, NetworkManager re-activates
+> that profile on whichever wifi device is still there — the dongle. Observed on the first suspend
+> after plugging one in: the dongle came back running the `wl` profile, i.e. **WPA2 with PMF
+> disabled instead of WPA3**, at the profile's default route metric, so the deliberate "make the
+> dongle primary" setting was silently undone. The internal card meanwhile fell back to the 2.4 GHz
+> profile. Binding both sides fixed it, verified across a further suspend.
+
+Verify:
+
+```sh
+nmcli -t -f DEVICE,STATE,CONNECTION device status   # each profile on its own device
+nmcli -g 802-11-wireless-security.key-mgmt connection show --active '<ssid>-usb'   # sae
+iw dev <iface> link                                # SSID, freq, VHT/HE bitrate
+iw dev <iface> get power_save                      # off
+ip route show default                              # dongle's route has the lower metric
+```
+
+> A route metric of `20050` rather than `50` right after activation is NetworkManager's +20000
+> penalty for a device whose per-device connectivity check has not passed yet. It clears within
+> seconds. Re-check before concluding the metric didn't take.
+
+**Suspend.** `rtw88_8821cu` survives S3 on this machine: across two cycles of 123 s and 92 s the
+dongle re-associated on its own with no hook, no module reload and working routing — unlike `wl`,
+which needs §3's sleep hook. It is not in any sleep hook and does not appear to need one.
+
+**Retiring `wl` altogether** is the end state a dongle buys: it removes the sleep hook, the profile
+watcher, the PMF default and the mitigation hole in one step. Commands are in §10 — read the
+warning there first. Without `wl` there is no wifi at all when the dongle is absent.
 
 ### Removal
 
@@ -1007,12 +1088,21 @@ Things this runbook raised and nothing ever came back to. Listed worst-consequen
 |---|---|---|---|
 | 1 | **Resume hang never root-caused.** `facetimehd` is a suspect on circumstantial evidence only; the hang has not recurred since it left the resume path, which is consistent with a fix *and* with the hang simply being rare. | §5 | **Open, and unresolvable by design** — you cannot prove absence. `pm_trace` is disarmed, so a recurrence yields nothing; re-arm (`sudo touch /etc/pm-trace.enabled`) before trusting the machine somewhere inconvenient. |
 | 2 | **The ~5 mW drain figure conflicts with Apple's ~75 mW standby implication** by about 15×, with no explanation for the gap. | §5 | **Open.** Cross-check the gauge against state of charge over a week-long suspend, or against `energy_now` rather than `charge_now`. |
-| 3 | **The MT7921AU adapter was never bought.** The exit plan retires four of the local workarounds and the security-mitigation hole in one purchase, untouched since 2026-09-17. | §3 | **Open.** Buy on chipset (`MT7921` must appear in the listing), confirm `lsusb` shows `0e8d:7961`, then work through the §10 wifi rollback. |
-| 4 | **Thunderbolt idle power was never measured on this machine.** The ~2 W figure is upstream's estimate for an un-suspended Falcon Ridge controller, not an observation here. | §7 | **Open, and it needs the right conditions:** on battery (`power_now` measures the charger otherwise), screen dim, nothing running. Under ~6 W there is nothing to chase. |
-| 5 | **`lid-wake-guard`'s lid-closed path has not been exercised on a real cycle.** The logic and a dry run are verified and lid-open sleeps now stick, but no lid-close suspend has happened since it was installed. | §5 | **Open.** Close the lid, wait a minute, open it: it should wake. If it does not, check `grep ^LID0 /proc/acpi/wakeup` during a suspend. |
-| 6 | **The chrony/RTC repair path is dead code while `pm_trace` is disarmed.** `makestep 0.1 5` plus `pm-trace-rtc-fix` exist only to undo damage `pm_trace` does, and have not run since 2026-09-18. | §6 | **Open decision, no action needed.** Keep as a matched pair with `pm_trace`, or delete both together — never one alone. |
-| 7 | **`no_console_suspend` was never validated** and is believed inert, yet it sits on the cmdline of all three BLS entries. | §6 | **Open decision.** Harmless either way; remove per §10 for a clean cmdline. |
-| 8 | **The older 6.19.10 kernel would boot without wifi or camera.** *(Confirmed by inspection 2026-09-24: no `extra/`, empty `updates/`, no `kmod-wl` for it, and DKMS has built `facetimehd` only for 7.2.5.)* | §9 | **Half closed.** What remains is a decision: boot it once and build both modules for it, or remove it (`dnf remove kernel-core-6.19.10-300.fc44`) so a bad boot cannot land on a kernel with no network. |
+| 3 | **`wl` is still installed and tainting the kernel**, although a working dongle now carries the traffic. Retiring it would close the mitigation hole and three workarounds, at the cost of having no wifi whenever the dongle is absent. | §3, §10 | **Open decision.** Run for a while on the dongle first; the failure mode of getting this wrong is a laptop with no network and no ethernet port. |
+| 4 | **The MT7921AU was never measured.** The claim that it would beat the RTL8821CU's ~75 Mbit/s is inference from 2x2 ax + USB 3 + `mt76`, not data, and this machine's USB 3 complex is already known to misbehave for Thunderbolt. | §3 | **Open.** ~$25 settles it. Until then the runbook's recommendation of it over the Realtek rests on reasoning only. |
+| 5 | **One suspend woke after 11 seconds** on 2026-09-26, 13 s after a wifi reconfiguration, with no wake source recorded in `/sys/class/wakeup`. The two cycles either side of it slept their full duration and woke on the RTC alarm as expected. | §5 | **Open, unexplained, not reproduced.** Suspect in-flight USB/DHCP activity. If early wakes recur with the dongle plugged in, snapshot `/sys/class/wakeup` before and after and diff — that is what identified the lid-wake bug. |
+| 6 | **Thunderbolt idle power was never measured on this machine.** The ~2 W figure is upstream's estimate for an un-suspended Falcon Ridge controller, not an observation here. | §7 | **Open, and it needs the right conditions:** on battery (`power_now` measures the charger otherwise), screen dim, nothing running. Under ~6 W there is nothing to chase. |
+| 7 | **`lid-wake-guard`'s lid-closed path has not been exercised on a real cycle.** The logic and a dry run are verified and lid-open sleeps now stick, but no lid-close suspend has happened since it was installed. | §5 | **Open.** Close the lid, wait a minute, open it: it should wake. If it does not, check `grep ^LID0 /proc/acpi/wakeup` during a suspend. |
+| 8 | **The chrony/RTC repair path is dead code while `pm_trace` is disarmed.** `makestep 0.1 5` plus `pm-trace-rtc-fix` exist only to undo damage `pm_trace` does, and have not run since 2026-09-18. | §6 | **Open decision, no action needed.** Keep as a matched pair with `pm_trace`, or delete both together — never one alone. |
+| 9 | **`no_console_suspend` was never validated** and is believed inert, yet it sits on the cmdline of all three BLS entries. | §6 | **Open decision.** Harmless either way; remove per §10 for a clean cmdline. |
+| 10 | **The older 6.19.10 kernel would boot without wifi or camera.** *(Confirmed by inspection 2026-09-24: no `extra/`, empty `updates/`, no `kmod-wl` for it, and DKMS has built `facetimehd` only for 7.2.5.)* | §9 | **Half closed.** What remains is a decision: boot it once and build both modules for it, or remove it (`dnf remove kernel-core-6.19.10-300.fc44`) so a bad boot cannot land on a kernel with no network. |
+
+**Closed 2026-09-26:**
+
+- **A dongle exists and works** — RTL8821CU, in-kernel driver, real WPA3/SAE, survives S3 without
+  a sleep hook, now primary. The four-year-old "exit plan" is half executed (§3).
+- **Profiles no longer migrate between adapters** — every wifi profile is bound to its interface,
+  after the dongle came back from a suspend running `wl`'s WPA2 profile (§3).
 
 **Closed 2026-09-24:**
 
