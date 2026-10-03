@@ -3,6 +3,12 @@
 Fedora 44 on a 2015 MacBook Air (`MacBookAir7,2`): the local workarounds it needs, why each one
 exists, and how to undo it.
 
+> **On Fedora Atomic?** This runbook targets Fedora Workstation (dnf, DKMS, KDE Plasma). For
+> the Atomic port — `rpm-ostree` layering, akmods instead of DKMS, files under `/etc` instead of
+> read-only `/usr`, and Sway instead of KDE — see
+> **[jpagh/fedora-air-atomic](https://github.com/jpagh/fedora-air-atomic)**. The hardware
+> research is all here; the Atomic port re-implements it and adds a guided `atomic-setup.sh`.
+
 Apple's 2015 hardware needs a proprietary wifi driver, an out-of-tree camera driver built from
 source, and a sleep hook to stop the machine waking itself six seconds after every idle suspend.
 None of it is shipped by any package, so nothing recreates it after a reinstall and nothing warns
